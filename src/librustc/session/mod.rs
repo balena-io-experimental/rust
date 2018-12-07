@@ -26,7 +26,10 @@ use util::common::{duration_to_secs_str, ErrorReported};
 use util::common::ProfileQueriesMsg;
 
 use rustc_data_structures::base_n;
-use rustc_data_structures::sync::{self, Lrc, Lock, LockCell, OneThread, Once, RwLock};
+use rustc_data_structures::sync::{
+    self, Lrc, Lock, OneThread, Once, RwLock, AtomicU64, AtomicUsize, AtomicBool, Ordering,
+    Ordering::SeqCst,
+};
 
 use errors::{self, DiagnosticBuilder, DiagnosticId, Applicability};
 use errors::emitter::{Emitter, EmitterWriter};
@@ -51,7 +54,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod code_stats;
 pub mod config;
@@ -129,6 +131,9 @@ pub struct Session {
     pub profile_channel: Lock<Option<mpsc::Sender<ProfileQueriesMsg>>>,
 
     /// Used by -Z self-profile
+    pub self_profiling_active: bool,
+
+    /// Used by -Z self-profile
     pub self_profiling: Lock<SelfProfiler>,
 
     /// Some measurements that are being gathered during compilation.
@@ -142,15 +147,15 @@ pub struct Session {
     /// If -zfuel=crate=n is specified, Some(crate).
     optimization_fuel_crate: Option<String>,
     /// If -zfuel=crate=n is specified, initially set to n. Otherwise 0.
-    optimization_fuel_limit: LockCell<u64>,
+    optimization_fuel_limit: AtomicU64,
     /// We're rejecting all further optimizations.
-    out_of_fuel: LockCell<bool>,
+    out_of_fuel: AtomicBool,
 
     // The next two are public because the driver needs to read them.
     /// If -zprint-fuel=crate, Some(crate).
     pub print_fuel_crate: Option<String>,
     /// Always set to zero and incremented so that we can print fuel expended by a crate.
-    pub print_fuel: LockCell<u64>,
+    pub print_fuel: AtomicU64,
 
     /// Loaded up early on in the initialization of this `Session` to avoid
     /// false positives about a job server in our environment.
@@ -825,10 +830,17 @@ impl Session {
         }
     }
 
+    #[inline(never)]
+    #[cold]
+    fn profiler_active<F: FnOnce(&mut SelfProfiler) -> ()>(&self, f: F) {
+        let mut profiler = self.self_profiling.borrow_mut();
+        f(&mut profiler);
+    }
+
+    #[inline(always)]
     pub fn profiler<F: FnOnce(&mut SelfProfiler) -> ()>(&self, f: F) {
-        if self.opts.debugging_opts.self_profile || self.opts.debugging_opts.profile_json {
-            let mut profiler = self.self_profiling.borrow_mut();
-            f(&mut profiler);
+        if unlikely!(self.self_profiling_active) {
+            self.profiler_active(f)
         }
     }
 
@@ -859,30 +871,41 @@ impl Session {
                  self.perf_stats.normalize_projection_ty.load(Ordering::Relaxed));
     }
 
-    /// We want to know if we're allowed to do an optimization for crate foo from -z fuel=foo=n.
-    /// This expends fuel if applicable, and records fuel if applicable.
-    pub fn consider_optimizing<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
+    #[inline(never)]
+    #[cold]
+    pub fn consider_optimizing_cold<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
         let mut ret = true;
         if let Some(ref c) = self.optimization_fuel_crate {
             if c == crate_name {
                 assert_eq!(self.query_threads(), 1);
-                let fuel = self.optimization_fuel_limit.get();
+                let fuel = self.optimization_fuel_limit.load(SeqCst);
                 ret = fuel != 0;
-                if fuel == 0 && !self.out_of_fuel.get() {
+                if fuel == 0 && !self.out_of_fuel.load(SeqCst) {
                     eprintln!("optimization-fuel-exhausted: {}", msg());
-                    self.out_of_fuel.set(true);
+                    self.out_of_fuel.store(true, SeqCst);
                 } else if fuel > 0 {
-                    self.optimization_fuel_limit.set(fuel - 1);
+                    self.optimization_fuel_limit.store(fuel - 1, SeqCst);
                 }
             }
         }
         if let Some(ref c) = self.print_fuel_crate {
             if c == crate_name {
                 assert_eq!(self.query_threads(), 1);
-                self.print_fuel.set(self.print_fuel.get() + 1);
+                self.print_fuel.store(self.print_fuel.load(SeqCst) + 1, SeqCst);
             }
         }
         ret
+    }
+
+    /// We want to know if we're allowed to do an optimization for crate foo from -z fuel=foo=n.
+    /// This expends fuel if applicable, and records fuel if applicable.
+    #[inline(always)]
+    pub fn consider_optimizing<T: Fn() -> String>(&self, crate_name: &str, msg: T) -> bool {
+        if likely!(self.optimization_fuel_crate.is_none() && self.print_fuel_crate.is_none()) {
+            true
+        } else {
+            self.consider_optimizing_cold(crate_name, msg)
+        }
     }
 
     /// Returns the number of query threads that should be used for this
@@ -1121,9 +1144,9 @@ pub fn build_session_(
 
     let optimization_fuel_crate = sopts.debugging_opts.fuel.as_ref().map(|i| i.0.clone());
     let optimization_fuel_limit =
-        LockCell::new(sopts.debugging_opts.fuel.as_ref().map(|i| i.1).unwrap_or(0));
+        AtomicU64::new(sopts.debugging_opts.fuel.as_ref().map(|i| i.1).unwrap_or(0));
     let print_fuel_crate = sopts.debugging_opts.print_fuel.clone();
-    let print_fuel = LockCell::new(0);
+    let print_fuel = AtomicU64::new(0);
 
     let working_dir = env::current_dir().unwrap_or_else(|e|
         p_s.span_diagnostic
@@ -1137,6 +1160,9 @@ pub fn build_session_(
     } else {
         CguReuseTracker::new_disabled()
     };
+
+    let self_profiling_active = sopts.debugging_opts.self_profile ||
+                                sopts.debugging_opts.profile_json;
 
     let sess = Session {
         target: target_cfg,
@@ -1168,6 +1194,7 @@ pub fn build_session_(
         imported_macro_spans: OneThread::new(RefCell::new(FxHashMap::default())),
         incr_comp_session: OneThread::new(RefCell::new(IncrCompSession::NotInitialized)),
         cgu_reuse_tracker,
+        self_profiling_active,
         self_profiling: Lock::new(SelfProfiler::new()),
         profile_channel: Lock::new(None),
         perf_stats: PerfStats {
@@ -1182,7 +1209,7 @@ pub fn build_session_(
         optimization_fuel_limit,
         print_fuel_crate,
         print_fuel,
-        out_of_fuel: LockCell::new(false),
+        out_of_fuel: AtomicBool::new(false),
         // Note that this is unsafe because it may misinterpret file descriptors
         // on Unix as jobserver file descriptors. We hopefully execute this near
         // the beginning of the process though to ensure we don't get false

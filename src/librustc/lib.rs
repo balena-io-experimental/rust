@@ -59,7 +59,9 @@
 #![feature(slice_patterns)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(specialization)]
+#![feature(stmt_expr_attributes)]
 #![feature(unboxed_closures)]
+#![feature(thread_local)]
 #![feature(trace_macros)]
 #![feature(trusted_len)]
 #![feature(vec_remove_item)]
@@ -69,12 +71,16 @@
 #![feature(in_band_lifetimes)]
 #![feature(crate_visibility_modifier)]
 #![feature(transpose_result)]
+#![feature(arbitrary_self_types)]
+#![feature(hash_raw_entry)]
+#![feature(maybe_uninit)]
 
 #![recursion_limit="512"]
 
 #![warn(elided_lifetimes_in_paths)]
 
 extern crate arena;
+extern crate rustc_hash;
 #[macro_use] extern crate bitflags;
 extern crate core;
 extern crate fmt_macros;

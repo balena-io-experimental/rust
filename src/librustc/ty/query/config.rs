@@ -52,7 +52,8 @@ pub(super) trait QueryAccessors<'tcx>: QueryConfig<'tcx> {
     fn to_dep_node(tcx: TyCtxt<'_, 'tcx, '_>, key: &Self::Key) -> DepNode;
 
     // Don't use this method to compute query results, instead use the methods on TyCtxt
-    fn compute(tcx: TyCtxt<'_, 'tcx, '_>, key: Self::Key) -> Self::Value;
+    #[inline(always)]
+    fn compute(tcx: TyCtxt<'_, 'tcx, 'tcx>, key: Self::Key) -> Self::Value;
 
     fn handle_cycle_error(tcx: TyCtxt<'_, 'tcx, '_>) -> Self::Value;
 }

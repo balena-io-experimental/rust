@@ -12,14 +12,18 @@
 
 use std::mem;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::sync::{Lock, LockGuard, Lrc, Weak};
+use rustc_data_structures::sync::{Lock, LockGuard, Lrc, LrcRef, Weak};
 use rustc_data_structures::OnDrop;
 use syntax_pos::Span;
 use ty::tls;
 use ty::query::Query;
 use ty::query::plumbing::CycleError;
+#[cfg(not(parallel_queries))]
+use ty::query::{
+    plumbing::TryGetJob,
+    config::QueryDescription,
+};
 use ty::context::TyCtxt;
-use errors::Diagnostic;
 use std::process;
 use std::{fmt, ptr};
 
@@ -34,15 +38,6 @@ use {
     syntax_pos::DUMMY_SP,
     rustc_data_structures::stable_hasher::{StableHasherResult, StableHasher, HashStable},
 };
-
-/// Indicates the state of a query for a given key in a query map
-pub(super) enum QueryResult<'tcx> {
-    /// An already executing query. The query job can be used to await for its completion
-    Started(Lrc<QueryJob<'tcx>>),
-
-    /// The query panicked. Queries trying to wait on this will raise a fatal error / silently panic
-    Poisoned,
-}
 
 /// A span and a query key
 #[derive(Clone, Debug)]
@@ -59,9 +54,6 @@ pub struct QueryJob<'tcx> {
     /// The parent query job which created this job and is implicitly waiting on it.
     pub parent: Option<Lrc<QueryJob<'tcx>>>,
 
-    /// Diagnostic messages which are emitted while the query executes
-    pub diagnostics: Lock<Vec<Diagnostic>>,
-
     /// The latch which is used to wait on this job
     #[cfg(parallel_queries)]
     latch: QueryLatch<'tcx>,
@@ -71,7 +63,6 @@ impl<'tcx> QueryJob<'tcx> {
     /// Creates a new query job
     pub fn new(info: QueryInfo<'tcx>, parent: Option<Lrc<QueryJob<'tcx>>>) -> Self {
         QueryJob {
-            diagnostics: Lock::new(Vec::new()),
             info,
             parent,
             #[cfg(parallel_queries)]
@@ -83,36 +74,44 @@ impl<'tcx> QueryJob<'tcx> {
     ///
     /// For single threaded rustc there's no concurrent jobs running, so if we are waiting for any
     /// query that means that there is a query cycle, thus this always running a cycle error.
+    #[cfg(not(parallel_queries))]
+    #[inline(never)]
+    #[cold]
+    pub(super) fn await<'lcx, 'a, D: QueryDescription<'tcx>>(
+        &self,
+        tcx: TyCtxt<'_, 'tcx, 'lcx>,
+        span: Span,
+    ) -> TryGetJob<'a, 'tcx, D> {
+        TryGetJob::JobCompleted(Err(Box::new(self.find_cycle_in_stack(tcx, span))))
+    }
+
+    /// Awaits for the query job to complete.
+    ///
+    /// For single threaded rustc there's no concurrent jobs running, so if we are waiting for any
+    /// query that means that there is a query cycle, thus this always running a cycle error.
+    #[cfg(parallel_queries)]
     pub(super) fn await<'lcx>(
         &self,
         tcx: TyCtxt<'_, 'tcx, 'lcx>,
         span: Span,
-    ) -> Result<(), CycleError<'tcx>> {
-        #[cfg(not(parallel_queries))]
-        {
-            self.find_cycle_in_stack(tcx, span)
-        }
-
-        #[cfg(parallel_queries)]
-        {
-            tls::with_related_context(tcx, move |icx| {
-                let mut waiter = Lrc::new(QueryWaiter {
-                    query: icx.query.clone(),
-                    span,
-                    cycle: Lock::new(None),
-                    condvar: Condvar::new(),
-                });
-                self.latch.await(&waiter);
-                // FIXME: Get rid of this lock. We have ownership of the QueryWaiter
-                // although another thread may still have a Lrc reference so we cannot
-                // use Lrc::get_mut
-                let mut cycle = waiter.cycle.lock();
-                match cycle.take() {
-                    None => Ok(()),
-                    Some(cycle) => Err(cycle)
-                }
-            })
-        }
+    ) -> Result<(), Box<CycleError<'tcx>>> {
+        tls::with_related_context(tcx, move |icx| {
+            let mut waiter = Lrc::new(QueryWaiter {
+                query: icx.query.map(|q| LrcRef::into(q)),
+                span,
+                cycle: Lock::new(None),
+                condvar: Condvar::new(),
+            });
+            self.latch.await(&waiter);
+            // FIXME: Get rid of this lock. We have ownership of the QueryWaiter
+            // although another thread may still have a Lrc reference so we cannot
+            // use Lrc::get_mut
+            let mut cycle = waiter.cycle.lock();
+            match cycle.take() {
+                None => Ok(()),
+                Some(cycle) => Err(Box::new(cycle))
+            }
+        })
     }
 
     #[cfg(not(parallel_queries))]
@@ -120,9 +119,11 @@ impl<'tcx> QueryJob<'tcx> {
         &self,
         tcx: TyCtxt<'_, 'tcx, 'lcx>,
         span: Span,
-    ) -> Result<(), CycleError<'tcx>> {
+    ) -> CycleError<'tcx> {
         // Get the current executing query (waiter) and find the waitee amongst its parents
-        let mut current_job = tls::with_related_context(tcx, |icx| icx.query.clone());
+        let mut current_job = tls::with_related_context(tcx, |icx| {
+            icx.query.map(|q| LrcRef::into(q))
+        });
         let mut cycle = Vec::new();
 
         while let Some(job) = current_job {
@@ -140,10 +141,10 @@ impl<'tcx> QueryJob<'tcx> {
                 let usage = job.parent.as_ref().map(|parent| {
                     (job.info.span, parent.info.query.clone())
                 });
-                return Err(CycleError { usage, cycle });
+                return CycleError { usage, cycle };
             }
 
-            current_job = job.parent.clone();
+            current_job = job.parent.as_ref().map(|parent| parent.clone());
         }
 
         panic!("did not find a cycle")
